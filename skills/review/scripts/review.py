@@ -18,12 +18,12 @@ from pathlib import Path
 BASE_URL = os.environ.get("OMLX_BASE_URL", "http://127.0.0.1:8000")
 MODEL = os.environ.get("LOCAL_REVIEW_MODEL", "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit")
 CONFIDENCE_THRESHOLD = 0.80
-CONTEXT_BUDGET = 80_000   # chars of prompt text
+CONTEXT_BUDGET = int(os.environ.get("LOCAL_REVIEW_CONTEXT_BUDGET", 80_000))  # chars of prompt text
 WINDOW_PAD = 80           # lines around each hunk
 SHRUNK_PAD = 20           # pad after budget shrink
 WHOLE_FILE_MAX = 400      # files at or under this many lines are included whole
 MAX_WORKERS = 8           # matches oMLX max_concurrent_requests
-REQUEST_TIMEOUT = 300     # seconds per model call
+REQUEST_TIMEOUT = int(os.environ.get("LOCAL_REVIEW_REQUEST_TIMEOUT", 300))  # seconds per model call
 SKILL_DIR = Path(__file__).resolve().parent.parent
 EXCLUDED_NAMES = {"package-lock.json", "pnpm-lock.yaml"}
 
