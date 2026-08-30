@@ -307,7 +307,7 @@ def apply_verdict(finding, verdict):
     except (TypeError, ValueError):
         confidence = 0.0
     finding["confidence"] = confidence
-    finding["verified"] = bool(v.get("verified")) and confidence >= CONFIDENCE_THRESHOLD
+    finding["verified"] = v.get("verified") is True and confidence >= CONFIDENCE_THRESHOLD
     if v.get("note"):
         finding["verifier_note"] = str(v["note"])
     if finding["verified"]:
@@ -525,6 +525,14 @@ def self_test():
     f = apply_verdict(mk("a.py", 1, "high", "correctness"),
                       {"verified": True, "confidence": "not-a-number"})
     assert not f["verified"] and f["confidence"] == 0.0
+
+    f = apply_verdict(mk("a.py", 1, "high", "correctness"),
+                      {"verified": "false", "confidence": 0.99})
+    assert not f["verified"]
+
+    f = apply_verdict(mk("a.py", 1, "high", "correctness"),
+                      {"verified": "true", "confidence": 0.99})
+    assert not f["verified"]                 # stringified booleans are malformed too
 
     print("self-test OK", file=sys.stderr)
     return 0
