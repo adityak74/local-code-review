@@ -1,7 +1,9 @@
 # Local Review Council — v0 Design
 
 **Date:** 2026-08-29
-**Status:** Draft, pending review
+**Status:** Implemented. The "Context building" stage is superseded by
+[2026-08-30-graph-routing-layer-design.md](2026-08-30-graph-routing-layer-design.md)
+(deterministic code-graph routing); everything else here still binds.
 **Scope:** Minimal council (approved): git diff + changed-file context → 3 parallel role reviewers → verifier → JSON. No static analysis, no symbol/test discovery in v0.
 
 ## What this is

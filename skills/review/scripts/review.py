@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Local Review Council engine: git diff -> parallel role reviewers -> verifier -> JSON.
+"""Local Review Council engine: git diff -> code graph routing -> parallel
+role reviewers -> verifier -> JSON.
 
-Runs entirely against a local oMLX server. Stdlib only.
-Spec: docs/superpowers/specs/2026-08-29-local-review-council-design.md
+A deterministic first pass (codegraph.py: AST symbol graph, blast radius,
+risk ranking) decides WHERE to look; the local oMLX council decides whether
+there is actually a bug. Stdlib only.
+Specs: docs/superpowers/specs/2026-08-29-local-review-council-design.md
+       docs/superpowers/specs/2026-08-30-graph-routing-layer-design.md
 """
 import json
 import os
@@ -15,12 +19,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
 
+import codegraph  # sibling module; script dir is on sys.path when run directly
+
 BASE_URL = os.environ.get("OMLX_BASE_URL", "http://127.0.0.1:8000")
 MODEL = os.environ.get("LOCAL_REVIEW_MODEL", "lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit")
 CONFIDENCE_THRESHOLD = 0.80
 CONTEXT_BUDGET = int(os.environ.get("LOCAL_REVIEW_CONTEXT_BUDGET", 80_000))  # chars of prompt text
-WINDOW_PAD = 80           # lines around each hunk
+WINDOW_PAD = 80           # lines around each hunk (no-graph fallback)
 SHRUNK_PAD = 20           # pad after budget shrink
+SYMBOL_PAD = 5            # pad around symbol spans (already semantic units)
 WHOLE_FILE_MAX = 400      # files at or under this many lines are included whole
 MAX_WORKERS = 8           # matches oMLX max_concurrent_requests
 REQUEST_TIMEOUT = int(os.environ.get("LOCAL_REVIEW_REQUEST_TIMEOUT", 300))  # seconds per model call
@@ -80,19 +87,31 @@ def read_repo_file(path):
 def parse_diff(diff_text):
     """Split a unified diff into per-file segments, dropping binary and
     excluded (lockfile) segments entirely. Returns (clean_diff, hunks) where
-    hunks maps new-side path -> [(start, end), ...] 1-based inclusive ranges.
+    hunks maps new-side path -> [(start, end), ...] 1-based inclusive ranges
+    of the lines actually touched (+ lines at their new position, deletions
+    at the seam) — NOT whole-hunk spans, which would include context lines
+    and pollute the changed-symbol mapping.
     Deleted files (+++ /dev/null) stay in clean_diff but get no hunks entry."""
     kept, hunks = [], {}
     segment, new_path, old_path, ranges, binary = [], None, None, [], False
+    new_lineno = None  # new-side position inside the current hunk
+
+    def touch(n):
+        n = max(1, n)
+        if ranges and n <= ranges[-1][1] + 1:
+            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], n))
+        else:
+            ranges.append((n, n))
 
     def flush():
-        nonlocal segment, new_path, old_path, ranges, binary
+        nonlocal segment, new_path, old_path, ranges, binary, new_lineno
         path = new_path or old_path
         if segment and path and not binary and not is_excluded(path):
             kept.append("".join(segment))
             if new_path and ranges:
                 hunks.setdefault(new_path, []).extend(ranges)
         segment, new_path, old_path, ranges, binary = [], None, None, [], False
+        new_lineno = None
 
     for line in diff_text.splitlines(keepends=True):
         if line.startswith("diff --git "):
@@ -106,9 +125,14 @@ def parse_diff(diff_text):
             binary = True
         elif line.startswith("@@ "):
             plus = line.split("+", 1)[1].split(" ", 1)[0]      # "start,count" or "start"
-            start = int(plus.split(",")[0])
-            count = int(plus.split(",")[1]) if "," in plus else 1
-            ranges.append((start, max(start, start + count - 1)))
+            new_lineno = int(plus.split(",")[0])
+        elif new_lineno is not None and line.startswith("+"):
+            touch(new_lineno)
+            new_lineno += 1
+        elif new_lineno is not None and line.startswith("-"):
+            touch(new_lineno)
+        elif new_lineno is not None and line.startswith(" "):
+            new_lineno += 1
     flush()
     return "".join(kept), hunks
 
@@ -133,40 +157,93 @@ def format_windows(path, lines, windows):
     return "\n".join(parts)
 
 
-def build_context(diff_text, hunks, read_file):
-    """Diff + changed-file windows under CONTEXT_BUDGET.
-    Over budget: cap the diff itself, then shrink pads to SHRUNK_PAD, then
-    drop largest file blocks. Returns (context, truncated)."""
+def build_context(diff_text, hunks, read_file, analysis=None):
+    """Diff (+ impact report + blast-radius code when a graph analysis is
+    given) + changed-file windows under CONTEXT_BUDGET. With analysis,
+    changed .py files use symbol-span ranges (SYMBOL_PAD); everything else
+    keeps hunk windows (WINDOW_PAD). Over budget: cap the diff, drop blast
+    blocks lowest-score-first (not counted as truncation — they are bonus
+    context), then shrink pads, then drop largest changed blocks.
+    Returns (context, truncated)."""
     truncated = False
     if len(diff_text) > CONTEXT_BUDGET:
         diff_text = diff_text[:CONTEXT_BUDGET] + "\n[diff truncated: exceeded context budget]\n"
         truncated = True
+    report = analysis["report"] if analysis else ""
+    file_ranges = analysis["file_ranges"] if analysis else {}
 
     entries = []
     for path in sorted(hunks):
         lines = read_file(path)
         if lines is not None:
-            entries.append((path, lines, hunks[path]))
+            ranges = file_ranges.get(path)
+            entries.append((path, lines, ranges or hunks[path],
+                            SYMBOL_PAD if ranges else WINDOW_PAD))
 
-    def render(pad):
+    def render(shrunk):
         blocks = []
-        for path, lines, ranges in entries:
+        for path, lines, ranges, pad in entries:
             if len(lines) <= WHOLE_FILE_MAX:
                 windows = [(1, len(lines))] if lines else []
             else:
-                windows = merge_windows(ranges, pad, len(lines))
+                windows = merge_windows(ranges, min(pad, SHRUNK_PAD) if shrunk else pad,
+                                        len(lines))
             blocks.append(format_windows(path, lines, windows))
         return blocks
 
-    blocks = render(WINDOW_PAD)
-    if len(diff_text) + sum(map(len, blocks)) > CONTEXT_BUDGET:
+    extra = []  # blast-radius blocks, already ordered best score first
+    for b in (analysis["extra_blocks"] if analysis else []):
+        lines = read_file(b["path"])
+        if lines:
+            windows = merge_windows(b["ranges"], SYMBOL_PAD, len(lines))
+            extra.append(format_windows(b["path"], lines, windows))
+
+    def total(blocks):
+        return (len(diff_text) + len(report) +
+                sum(map(len, blocks)) + sum(map(len, extra)))
+
+    blocks = render(False)
+    while extra and total(blocks) > CONTEXT_BUDGET:
+        extra.pop()
+    if total(blocks) > CONTEXT_BUDGET:
         truncated = True
-        blocks = render(SHRUNK_PAD)
-        while blocks and len(diff_text) + sum(map(len, blocks)) > CONTEXT_BUDGET:
+        blocks = render(True)
+        while blocks and total(blocks) > CONTEXT_BUDGET:
             blocks.remove(max(blocks, key=len))
-    context = ("## Diff\n" + diff_text +
-               "\n\n## Changed file context (line-numbered)\n" + "\n\n".join(blocks))
-    return context, truncated
+
+    parts = ["## Diff\n" + diff_text]
+    if report:
+        parts.append(report)
+    parts.append("## Changed file context (line-numbered)\n" + "\n\n".join(blocks))
+    if extra:
+        parts.append("## Blast radius context (line-numbered, code NOT in the diff)\n"
+                     + "\n\n".join(extra))
+    return "\n\n".join(parts), truncated
+
+
+def graph_analysis(hunks):
+    """Deterministic first pass (codegraph) over the .py hunks. Returns the
+    analysis dict or None; any failure degrades to v0 hunk windows — the
+    routing layer must never kill a review."""
+    py_hunks = {p: r for p, r in hunks.items() if p.endswith(".py")}
+    if not py_hunks:
+        return None
+    try:
+        proc = subprocess.run(["git", "ls-files", "*.py"], cwd=repo_root(),
+                              capture_output=True, text=True)
+        files = proc.stdout.splitlines() if proc.returncode == 0 else list(py_hunks)
+        files = codegraph.prefilter_files(repo_root(), files, set(py_hunks))
+        analysis = codegraph.analyze(codegraph.build_graph(repo_root(), files),
+                                     py_hunks)
+        st = analysis["stats"]
+        warn(f"code graph: {st['files_indexed']} files, {st['symbols']} symbols, "
+             f"{st['changed_symbols']} changed, {st['impacted_symbols']} impacted, "
+             f"{st['untested_changed']} untested")
+        return analysis
+    except Exception as e:
+        warn(f"code graph failed ({type(e).__name__}: {e}); "
+             "falling back to hunk windows")
+        return None
 
 
 ROLES = ("correctness", "security", "regression")
@@ -363,7 +440,8 @@ def main(argv):
         if not clean_diff.strip():
             print(json.dumps({"findings": [], "note": "nothing to review"}))
             return 0
-        context, truncated = build_context(clean_diff, hunks, read_repo_file)
+        analysis = graph_analysis(hunks)
+        context, truncated = build_context(clean_diff, hunks, read_repo_file, analysis)
         warn(f"reviewing {len(hunks)} file(s), context {len(context)} chars")
         candidates, malformed, failed_roles = run_council(context, api_key)
         candidates = dedupe(candidates)
@@ -381,6 +459,7 @@ def main(argv):
                 "context_truncated": truncated,
                 "malformed_dropped": malformed,
                 "failed_reviewers": failed_roles,
+                **({"graph": analysis["stats"]} if analysis else {}),
             },
         }, indent=1))
         return 0
@@ -434,7 +513,8 @@ def self_test():
     )
     clean, hunks = parse_diff(sample_diff)
     assert list(hunks) == ["api/users.py"], hunks
-    assert hunks["api/users.py"] == [(10, 13), (41, 42)], hunks
+    # actual touched lines, not whole-hunk spans (context lines excluded)
+    assert hunks["api/users.py"] == [(11, 12), (42, 42)], hunks
     assert "package-lock.json" not in clean and "logo.png" not in clean
     assert "gone.py" in clean          # deletions stay visible in the diff
     assert "api/users.py" in clean
@@ -476,6 +556,41 @@ def self_test():
     ctx, _ = build_context("DIFFTEXT", missing,
                            lambda p: lines if p == "api/users.py" else None)
     assert "moved.py" not in ctx.split("DIFFTEXT")[1]  # unreadable file skipped
+
+    # -- graph routing integration --------------------------------------
+    assert codegraph.self_test() == 0
+
+    numbered = [f"x{i}" for i in range(1, 1001)]       # > WHOLE_FILE_MAX
+    fake = {
+        "report": "## Impact analysis (deterministic, from the code graph)\n"
+                  "- HIGH 0.90 big.py:100-120 f — no test reaches it",
+        "file_ranges": {"big.py": [(100, 120)]},
+        "extra_blocks": [{"path": "caller.py", "ranges": [(50, 60)], "score": 0.6}],
+        "stats": {"changed_symbols": 1},
+    }
+    ctx, truncated = build_context(
+        "DIFF", {"big.py": [(100, 105)], "style.css": [(100, 105)]},
+        lambda p: numbered, fake)
+    assert not truncated
+    assert "## Impact analysis" in ctx and "## Blast radius context" in ctx
+    changed_part = ctx.split("## Changed file context")[1].split("## Blast radius")[0]
+    big_part = changed_part.split("=== style.css ===")[0]
+    css_part = changed_part.split("=== style.css ===")[1]
+    assert "95: x95" in big_part and "125: x125" in big_part   # SYMBOL_PAD spans
+    assert "94: x94" not in big_part                            # not hunk windows
+    assert "25: x25" in css_part                # non-.py keeps WINDOW_PAD windows
+    blast_part = ctx.split("## Blast radius")[1]
+    assert "45: x45" in blast_part and "65: x65" in blast_part
+
+    # over budget: blast blocks are dropped first, silently (no truncation flag)
+    many = dict(fake, extra_blocks=[{"path": f"c{n}.py", "ranges": [(1, 1000)],
+                                     "score": 0.5} for n in range(60)])
+    ctx, truncated = build_context("DIFF", {"big.py": [(100, 105)]},
+                                   lambda p: numbered, many)
+    assert not truncated
+    assert len(ctx) <= CONTEXT_BUDGET + 300
+    assert "=== big.py ===" in ctx                 # changed context survives
+    assert ctx.count("=== c") < 60                 # most blast blocks dropped
 
     # -- Task 3: JSON extraction + finding normalization ----------------
     assert extract_json_array('noise [1, 2] tail') == [1, 2]
