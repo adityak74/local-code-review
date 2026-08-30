@@ -1,0 +1,13 @@
+{
+  "name": "local-code-review",
+  "owner": {
+    "name": "Aditya Karnam"
+  },
+  "plugins": [
+    {
+      "name": "local-review",
+      "source": "./",
+      "description": "Review your diff with a parallel council of local AI reviewers (correctness, security, regression + verifier) running through oMLX. Nothing leaves your machine."
+    }
+  ]
+}

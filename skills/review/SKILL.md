@@ -1,5 +1,4 @@
 ---
-name: local-review
 description: Review code using a parallel council of local AI reviewers (correctness, security, regression + verifier) running through oMLX. Use when the user asks for a local review of their diff, staged changes, or a ref range.
 disable-model-invocation: true
 allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/review.py *)

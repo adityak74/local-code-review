@@ -1,0 +1,8 @@
+{
+  "name": "local-review",
+  "description": "100% local, parallel, evidence-verified code review council powered by oMLX on Apple Silicon.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Aditya Karnam"
+  }
+}

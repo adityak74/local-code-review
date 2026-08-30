@@ -57,7 +57,7 @@ Claude Code ──► /local-review ──► review.py
                     Claude explains · fixes · comments
 ```
 
-The entire engine is **one stdlib-only Python file** (`scripts/review.py`). No pip installs, no venv, no framework. `SKILL.md` is a thin UX layer; the deterministic pipeline lives in Python where it belongs.
+The entire engine is **one stdlib-only Python file** (`skills/review/scripts/review.py`). No pip installs, no venv, no framework. `SKILL.md` is a thin UX layer; the deterministic pipeline lives in Python where it belongs.
 
 ## Quickstart
 
@@ -68,20 +68,27 @@ pip install omlx        # or: brew install omlx
 omlx start              # OpenAI-compatible server on 127.0.0.1:8000
 ```
 
-**2. Install the skill:**
+**2. Install in Claude Code — as a plugin** (this repo is its own marketplace):
+
+```text
+/plugin marketplace add adityak74/local-code-review
+/plugin install local-review@local-code-review
+```
+
+Or as a personal skill via symlink:
 
 ```bash
 git clone https://github.com/adityak74/local-code-review.git ~/Projects/local-code-review
-ln -sfn ~/Projects/local-code-review ~/.claude/skills/local-review
+ln -sfn ~/Projects/local-code-review/skills/review ~/.claude/skills/local-review
 ```
 
 **3. Review from Claude Code:**
 
 ```text
-/local-review              # all uncommitted work
-/local-review --staged     # staged changes only
-/local-review HEAD~3       # last three commits
-/local-review main...      # your whole branch
+/local-review:review           # plugin install (use /local-review for the symlink install)
+/local-review:review --staged  # staged changes only
+/local-review:review HEAD~3    # last three commits
+/local-review:review main...   # your whole branch
 ```
 
 Arguments pass straight through to `git diff` — every range you already know just works.
@@ -89,8 +96,37 @@ Arguments pass straight through to `git diff` — every range you already know j
 **Standalone (no Claude Code):** the engine is a plain script that prints JSON:
 
 ```bash
-python3 scripts/review.py --staged | jq '.findings'
+python3 skills/review/scripts/review.py --staged | jq '.findings'
 ```
+
+## Use it with any coding agent
+
+The engine has no Claude dependency — it's one command that prints one JSON object, so any agent that can run shell commands can use it. Paste this block into the instruction file your agent reads:
+
+```markdown
+## Local code review
+
+To review code changes with a local AI review council, run:
+
+    python3 ~/Projects/local-code-review/skills/review/scripts/review.py [git-diff-args]
+
+(no args = all uncommitted work; `--staged`, `HEAD~3`, `main...` etc. pass through to git diff).
+It prints one JSON object; progress on stderr can be ignored. Report ONLY the entries in
+`findings` (they are verifier-approved) with file:line, severity, and evidence; mention the
+`rejected_count`. If the JSON has an `error` key, show it and stop (usually fixed by `omlx start`).
+Never invent findings beyond the JSON.
+```
+
+Where to paste it:
+
+| Agent | Instruction file |
+|---|---|
+| **Claude Code** | none needed — install the plugin or skill above |
+| **Codex CLI** | `AGENTS.md` (repo root or `~/.codex/AGENTS.md`) |
+| **OpenCode** | `AGENTS.md` in the project root |
+| **GitHub Copilot** | `.github/copilot-instructions.md` |
+| **Cursor** | `AGENTS.md` or a rule in `.cursor/rules/` |
+| **Anything else** | wherever it reads custom instructions — the engine is just a shell command |
 
 ## Configuration
 
@@ -102,7 +138,7 @@ Three environment variables. That's all of it.
 | `OMLX_BASE_URL` | `http://127.0.0.1:8000` | oMLX server address |
 | `OMLX_API_KEY` | read from `~/.omlx/settings.json` | Auth, if you've enabled it |
 
-Reviewer behavior lives in plain-markdown prompts (`prompts/*.md`) — edit them, no code changes required.
+Reviewer behavior lives in plain-markdown prompts (`skills/review/prompts/*.md`) — edit them, no code changes required.
 
 ## Output contract
 
@@ -146,10 +182,10 @@ The Claude Code skill is the first distribution surface, not the architecture. T
 
 - [x] Design spec ([docs/superpowers/specs](docs/superpowers/specs/2026-08-29-local-review-council-design.md))
 - [x] v0: council + verifier engine, Claude Code skill
+- [x] Claude Code plugin + self-hosted marketplace (`/local-review:review`)
 - [ ] Standalone CLI polish (`local-review` entry point)
 - [ ] Static analysis + changed-symbol/test discovery feeding reviewer context
 - [ ] MCP server (one reviewer for Claude Code, Codex, OpenCode, Zed, …)
-- [ ] Claude Code plugin packaging (`/local-review:review`, `/local-review:security`)
 - [ ] GitHub Action & pre-commit hook
 - [ ] llama.cpp backend (the engine only speaks OpenAI-compatible HTTP)
 
