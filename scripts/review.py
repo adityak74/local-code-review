@@ -262,21 +262,125 @@ def run_council(context, api_key):
     return findings, dropped, failed
 
 
+SEV_RANK = {"high": 2, "medium": 1, "low": 0}
+
+
+def dedupe(findings):
+    """Collapse findings sharing (file, line within ±2, category). Keeps the
+    higher severity and merges reviewer attribution."""
+    out = []
+    for f in findings:
+        match = next((g for g in out
+                      if g["file"] == f["file"] and g["category"] == f["category"]
+                      and abs(g["line"] - f["line"]) <= 2), None)
+        if match is None:
+            out.append(dict(f, reviewers=list(f["reviewers"])))
+            continue
+        if SEV_RANK[f["severity"]] > SEV_RANK[match["severity"]]:
+            match["severity"] = f["severity"]
+        for r in f["reviewers"]:
+            if r not in match["reviewers"]:
+                match["reviewers"].append(r)
+    return out
+
+
+def extract_json_object(text):
+    """First parseable JSON object anywhere in text, else None."""
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch == "{":
+            try:
+                val, _ = decoder.raw_decode(text[i:])
+            except ValueError:
+                continue
+            if isinstance(val, dict):
+                return val
+    return None
+
+
+def apply_verdict(finding, verdict):
+    """Fold a verifier verdict into a finding. Failed/malformed verdicts
+    reject the finding — never silently promote."""
+    v = verdict if isinstance(verdict, dict) else {}
+    try:
+        confidence = float(v.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    finding["confidence"] = confidence
+    finding["verified"] = bool(v.get("verified")) and confidence >= CONFIDENCE_THRESHOLD
+    if v.get("note"):
+        finding["verifier_note"] = str(v["note"])
+    if finding["verified"]:
+        finding["reviewers"].append("verifier")
+    return finding
+
+
+def run_verifier(candidates, read_file, api_key):
+    """Verify each candidate in parallel (MAX_WORKERS cap, matching oMLX
+    max_concurrent_requests so nothing queues client-side)."""
+    prompt = load_prompt("verifier")
+
+    def one(finding):
+        lines = read_file(finding["file"])
+        if lines:
+            windows = merge_windows([(finding["line"], finding["line"])],
+                                    WINDOW_PAD, len(lines))
+            code = format_windows(finding["file"], lines, windows)
+        else:
+            code = "(file content unavailable)"
+        payload = {k: finding[k] for k in
+                   ("file", "line", "severity", "category", "title",
+                    "explanation", "evidence")}
+        try:
+            text = chat(prompt,
+                        "Candidate finding:\n" + json.dumps(payload, indent=1) +
+                        "\n\nRelevant code:\n" + code,
+                        api_key)
+            verdict = extract_json_object(text)
+        except Exception as e:
+            warn(f"verifier failed for {finding['file']}:{finding['line']}: {e}")
+            verdict = None
+        return apply_verdict(finding, verdict)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        return list(pool.map(one, candidates))
+
+
 def main(argv):
     if argv[:1] == ["--self-test"]:
         return self_test()
+    t0 = time.time()
     try:
+        api_key = load_api_key()
         diff = collect_diff(argv)
+        clean_diff, hunks = parse_diff(diff)
+        if not clean_diff.strip():
+            print(json.dumps({"findings": [], "note": "nothing to review"}))
+            return 0
+        context, truncated = build_context(clean_diff, hunks, read_repo_file)
+        warn(f"reviewing {len(hunks)} file(s), context {len(context)} chars")
+        candidates, malformed, failed_roles = run_council(context, api_key)
+        candidates = dedupe(candidates)
+        warn(f"council produced {len(candidates)} candidate finding(s); verifying")
+        results = run_verifier(candidates, read_repo_file, api_key)
+        kept = [f for f in results if f["verified"]]
+        kept.sort(key=lambda f: (-SEV_RANK[f["severity"]], f["file"], f["line"]))
+        print(json.dumps({
+            "findings": kept,
+            "rejected_count": len(results) - len(kept),
+            "stats": {
+                "model": MODEL,
+                "duration_s": round(time.time() - t0, 1),
+                "files_reviewed": len(hunks),
+                "context_truncated": truncated,
+                "malformed_dropped": malformed,
+                "failed_reviewers": failed_roles,
+            },
+        }, indent=1))
+        return 0
     except ReviewError as e:
         print(json.dumps({"error": str(e)}))
         return 1
-    if not diff.strip():
-        print(json.dumps({"findings": [], "note": "nothing to review"}))
-        return 0
-    # Tasks 2-4 replace this stub with the full pipeline.
-    print(json.dumps({"findings": [],
-                      "note": f"engine incomplete: collected {len(diff)} diff bytes"}))
-    return 0
 
 
 def self_test():
@@ -381,6 +485,46 @@ def self_test():
 
     for role in ROLES:
         assert load_prompt(role).strip(), f"prompt {role}.md missing or empty"
+
+    # -- Task 4: dedupe + verdicts --------------------------------------
+    def mk(file, line, sev, cat):
+        return {"file": file, "line": line, "severity": sev, "category": cat,
+                "title": "t", "explanation": "e", "evidence": "ev",
+                "reviewers": [cat]}
+
+    deduped = dedupe([
+        mk("a.py", 10, "low", "correctness"),
+        mk("a.py", 11, "high", "correctness"),   # within ±2, same cat -> merged
+        mk("a.py", 10, "high", "security"),      # other category survives
+        mk("a.py", 50, "low", "correctness"),    # far away -> survives
+    ])
+    assert len(deduped) == 3, deduped
+    merged = next(f for f in deduped if f["category"] == "correctness"
+                  and f["line"] == 10)
+    assert merged["severity"] == "high"
+
+    assert extract_json_object('ok {"verified": true} done') == {"verified": True}
+    assert extract_json_object('nothing here') is None
+
+    f = apply_verdict(mk("a.py", 1, "high", "correctness"),
+                      {"verified": True, "confidence": 0.94, "note": "solid"})
+    assert f["verified"] and f["confidence"] == 0.94
+    assert f["verifier_note"] == "solid" and "verifier" in f["reviewers"]
+
+    f = apply_verdict(mk("a.py", 1, "high", "correctness"),
+                      {"verified": True, "confidence": 0.5})
+    assert not f["verified"]                       # below CONFIDENCE_THRESHOLD
+
+    f = apply_verdict(mk("a.py", 1, "high", "correctness"),
+                      {"verified": False, "confidence": 0.99})
+    assert not f["verified"]
+
+    f = apply_verdict(mk("a.py", 1, "high", "correctness"), None)
+    assert not f["verified"] and f["confidence"] == 0.0
+
+    f = apply_verdict(mk("a.py", 1, "high", "correctness"),
+                      {"verified": True, "confidence": "not-a-number"})
+    assert not f["verified"] and f["confidence"] == 0.0
 
     print("self-test OK", file=sys.stderr)
     return 0
