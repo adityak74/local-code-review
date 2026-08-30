@@ -169,6 +169,99 @@ def build_context(diff_text, hunks, read_file):
     return context, truncated
 
 
+ROLES = ("correctness", "security", "regression")
+REQUIRED_KEYS = {"file", "line", "severity", "title", "explanation", "evidence"}
+SEVERITIES = {"high", "medium", "low"}
+
+
+def load_prompt(name):
+    return (SKILL_DIR / "prompts" / f"{name}.md").read_text()
+
+
+def chat(system, user, api_key):
+    """One blocking non-streaming completion against oMLX. Raises on failure."""
+    body = json.dumps({
+        "model": MODEL,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+        "temperature": 0.2,
+        "max_tokens": 4096,
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        f"{BASE_URL}/v1/chat/completions", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {api_key}"})
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        data = json.loads(resp.read())
+    return data["choices"][0]["message"]["content"]
+
+
+def extract_json_array(text):
+    """First parseable JSON array anywhere in text, else []. Tolerates prose,
+    markdown fences, and broken candidates before the real one."""
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch == "[":
+            try:
+                val, _ = decoder.raw_decode(text[i:])
+            except ValueError:
+                continue
+            if isinstance(val, list):
+                return val
+    return []
+
+
+def normalize_findings(raw, category):
+    """Validate raw model findings. Returns (findings, dropped_count)."""
+    good, dropped = [], 0
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict) or not REQUIRED_KEYS <= set(f):
+            dropped += 1
+            continue
+        try:
+            line = int(f["line"])
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        sev = str(f["severity"]).lower()
+        good.append({
+            "file": str(f["file"]),
+            "line": line,
+            "severity": sev if sev in SEVERITIES else "low",
+            "category": category,
+            "title": str(f["title"]),
+            "explanation": str(f["explanation"]),
+            "evidence": str(f["evidence"]),
+            "reviewers": [category],
+        })
+    return good, dropped
+
+
+def run_council(context, api_key):
+    """Run all roles concurrently. Returns (findings, malformed_dropped,
+    failed_roles). Raises ReviewError only if every role fails."""
+    findings, dropped, failed = [], 0, []
+    with ThreadPoolExecutor(max_workers=len(ROLES)) as pool:
+        futures = {pool.submit(chat, load_prompt(r), context, api_key): r
+                   for r in ROLES}
+        for fut in as_completed(futures):
+            role = futures[fut]
+            try:
+                text = fut.result()
+            except Exception as e:
+                warn(f"{role} reviewer failed: {e}")
+                failed.append(role)
+                continue
+            good, d = normalize_findings(extract_json_array(text), role)
+            findings.extend(good)
+            dropped += d
+    if len(failed) == len(ROLES):
+        raise ReviewError(
+            f"all council reviewers failed; is oMLX up at {BASE_URL}? try 'omlx start'")
+    return findings, dropped, failed
+
+
 def main(argv):
     if argv[:1] == ["--self-test"]:
         return self_test()
@@ -260,6 +353,34 @@ def self_test():
     ctx, _ = build_context("DIFFTEXT", missing,
                            lambda p: lines if p == "api/users.py" else None)
     assert "moved.py" not in ctx.split("DIFFTEXT")[1]  # unreadable file skipped
+
+    # -- Task 3: JSON extraction + finding normalization ----------------
+    assert extract_json_array('noise [1, 2] tail') == [1, 2]
+    assert extract_json_array('```json\n[{"a": 1}]\n```') == [{"a": 1}]
+    assert extract_json_array('broken [1,, then good ["x"]') == ["x"]
+    assert extract_json_array('no array here {"a": 1}') == []
+    assert extract_json_array('') == []
+
+    raw = [
+        {"file": "a.py", "line": 5, "severity": "HIGH", "title": "t",
+         "explanation": "e", "evidence": "ev"},
+        {"file": "a.py", "line": "12", "severity": "weird", "title": "t2",
+         "explanation": "e2", "evidence": "ev2"},
+        {"file": "a.py", "line": "not-a-number", "severity": "low",
+         "title": "t3", "explanation": "e3", "evidence": "ev3"},
+        {"file": "a.py", "title": "missing keys"},
+        "not even a dict",
+    ]
+    good, dropped = normalize_findings(raw, "correctness")
+    assert dropped == 3, (good, dropped)
+    assert good[0]["severity"] == "high" and good[0]["line"] == 5
+    assert good[1]["severity"] == "low" and good[1]["line"] == 12   # unknown -> low
+    assert all(f["category"] == "correctness" and f["reviewers"] == ["correctness"]
+               for f in good)
+    assert normalize_findings("not a list", "security") == ([], 0)
+
+    for role in ROLES:
+        assert load_prompt(role).strip(), f"prompt {role}.md missing or empty"
 
     print("self-test OK", file=sys.stderr)
     return 0
