@@ -17,6 +17,10 @@ The command prints one JSON object. Progress appears on stderr; ignore it.
 If the JSON contains an `error` key, show the user the message and stop —
 usually the fix is `omlx start`.
 
+On an empty diff, the engine prints `{"findings": [], "note": "nothing to
+review"}` with no `rejected_count` or `stats` keys — just tell the user there
+was nothing to review.
+
 Otherwise, report ONLY the findings in the `findings` array (they are
 verifier-approved). For each finding:
 

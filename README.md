@@ -2,7 +2,7 @@
 
 **A 100% local, parallel, evidence-verified code review council for Claude Code — powered by [oMLX](https://github.com/jundot/omlx) on Apple Silicon.**
 
-[![Status](https://img.shields.io/badge/status-v0_in_development-orange)](docs/superpowers/specs/2026-08-29-local-review-council-design.md)
+[![Status](https://img.shields.io/badge/status-v0-brightgreen)](docs/superpowers/specs/2026-08-29-local-review-council-design.md)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)](#how-it-works)
 [![Platform](https://img.shields.io/badge/platform-Apple_Silicon-black)](#requirements)
@@ -30,7 +30,7 @@ That last line is the point: this is not another LLM spraying review comments. E
 
 ## Why
 
-- **Private.** The diff, the context, the findings — everything stays on your Mac. Nothing is sent to any cloud.
+- **Private.** The diff, the context, the findings — everything stays on your Mac, as long as `OMLX_BASE_URL` points at a local server. Nothing is sent to any cloud.
 - **Parallel.** Three reviewers hit oMLX's continuous-batching server simultaneously; one loaded model serves the whole council at aggregate throughput a sequential loop can't touch.
 - **Verified.** A dedicated verifier pass adversarially re-checks each candidate against the real code and rejects anything speculative (confidence gate: 0.80).
 - **Honest architecture.** Claude Code is the interface and action layer; the local models are the analysis engine. Claude runs *one* command and interprets *one* JSON object — it never puppeteers the review micro-steps.
@@ -119,9 +119,17 @@ Reviewer behavior lives in plain-markdown prompts (`prompts/*.md`) — edit them
     }
   ],
   "rejected_count": 3,
-  "stats": { "model": "…", "duration_s": 41.2, "files_reviewed": 4 }
+  "stats": {
+    "model": "…", "duration_s": 41.2, "files_reviewed": 4,
+    "context_truncated": false, "malformed_dropped": 0, "failed_reviewers": []
+  }
 }
 ```
+
+On an empty diff, it short-circuits to `{"findings": [], "note": "nothing to
+review"}` — no `rejected_count` or `stats` keys. On a fatal error (git failure,
+oMLX unreachable, or anything unexpected), it prints `{"error": "…"}` and
+exits 1.
 
 Machine-readable by design — the Claude Code skill is the first consumer, not the only one.
 
@@ -137,13 +145,20 @@ Machine-readable by design — the Claude Code skill is the first consumer, not 
 The Claude Code skill is the first distribution surface, not the architecture. The engine is deliberately a standalone JSON-emitting program so more surfaces can wrap it:
 
 - [x] Design spec ([docs/superpowers/specs](docs/superpowers/specs/2026-08-29-local-review-council-design.md))
-- [ ] v0: council + verifier engine, Claude Code skill
+- [x] v0: council + verifier engine, Claude Code skill
 - [ ] Standalone CLI polish (`local-review` entry point)
 - [ ] Static analysis + changed-symbol/test discovery feeding reviewer context
 - [ ] MCP server (one reviewer for Claude Code, Codex, OpenCode, Zed, …)
 - [ ] Claude Code plugin packaging (`/local-review:review`, `/local-review:security`)
 - [ ] GitHub Action & pre-commit hook
 - [ ] llama.cpp backend (the engine only speaks OpenAI-compatible HTTP)
+
+## Known limitations (v0)
+
+- Pure renames and git-quoted paths are skipped by the diff parser.
+- The same bug flagged by two categories surfaces as two findings — dedupe is per-category by design.
+- Diff content is not defended against prompt injection; don't point it at untrusted PRs expecting adversarial robustness.
+- No overall wall-clock timeout.
 
 ## Contributing
 

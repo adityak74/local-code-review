@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
@@ -26,10 +25,7 @@ WHOLE_FILE_MAX = 400      # files at or under this many lines are included whole
 MAX_WORKERS = 8           # matches oMLX max_concurrent_requests
 REQUEST_TIMEOUT = 300     # seconds per model call
 SKILL_DIR = Path(__file__).resolve().parent.parent
-EXCLUDED_NAMES = {
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "Cargo.lock", "poetry.lock", "uv.lock", "Gemfile.lock", "composer.lock",
-}
+EXCLUDED_NAMES = {"package-lock.json", "pnpm-lock.yaml"}
 
 
 class ReviewError(Exception):
@@ -60,7 +56,7 @@ def collect_diff(args):
     cmd = ["git", "diff"] + (list(args) if args else ["HEAD"])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise ReviewError(f"git diff failed: {proc.stderr.strip()}")
+        raise ReviewError(f"git diff failed: {proc.stderr.strip()[:400]}")
     return proc.stdout
 
 
@@ -139,8 +135,13 @@ def format_windows(path, lines, windows):
 
 def build_context(diff_text, hunks, read_file):
     """Diff + changed-file windows under CONTEXT_BUDGET.
-    Over budget: shrink pads to SHRUNK_PAD, then drop largest file blocks.
-    The diff itself is always kept. Returns (context, truncated)."""
+    Over budget: cap the diff itself, then shrink pads to SHRUNK_PAD, then
+    drop largest file blocks. Returns (context, truncated)."""
+    truncated = False
+    if len(diff_text) > CONTEXT_BUDGET:
+        diff_text = diff_text[:CONTEXT_BUDGET] + "\n[diff truncated: exceeded context budget]\n"
+        truncated = True
+
     entries = []
     for path in sorted(hunks):
         lines = read_file(path)
@@ -157,7 +158,6 @@ def build_context(diff_text, hunks, read_file):
             blocks.append(format_windows(path, lines, windows))
         return blocks
 
-    truncated = False
     blocks = render(WINDOW_PAD)
     if len(diff_text) + sum(map(len, blocks)) > CONTEXT_BUDGET:
         truncated = True
@@ -242,6 +242,7 @@ def run_council(context, api_key):
     """Run all roles concurrently. Returns (findings, malformed_dropped,
     failed_roles). Raises ReviewError only if every role fails."""
     findings, dropped, failed = [], 0, []
+    last_exc = None
     with ThreadPoolExecutor(max_workers=len(ROLES)) as pool:
         futures = {pool.submit(chat, load_prompt(r), context, api_key): r
                    for r in ROLES}
@@ -252,13 +253,15 @@ def run_council(context, api_key):
             except Exception as e:
                 warn(f"{role} reviewer failed: {e}")
                 failed.append(role)
+                last_exc = e
                 continue
             good, d = normalize_findings(extract_json_array(text), role)
             findings.extend(good)
             dropped += d
     if len(failed) == len(ROLES):
         raise ReviewError(
-            f"all council reviewers failed; is oMLX up at {BASE_URL}? try 'omlx start'")
+            f"all council reviewers failed; is oMLX up at {BASE_URL}? "
+            f"try 'omlx start' (last error: {last_exc})")
     return findings, dropped, failed
 
 
@@ -277,7 +280,8 @@ def dedupe(findings):
             out.append(dict(f, reviewers=list(f["reviewers"])))
             continue
         if SEV_RANK[f["severity"]] > SEV_RANK[match["severity"]]:
-            match["severity"] = f["severity"]
+            match.update({k: f[k] for k in
+                          ("line", "severity", "title", "explanation", "evidence")})
         for r in f["reviewers"]:
             if r not in match["reviewers"]:
                 match["reviewers"].append(r)
@@ -285,16 +289,18 @@ def dedupe(findings):
 
 
 def extract_json_object(text):
-    """First parseable JSON object anywhere in text, else None."""
+    """Last parseable JSON object anywhere in text, else None. The real
+    verdict comes last in the response; earlier braces can be template/
+    example JSON inside a reasoning model's think-text."""
     decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch == "{":
-            try:
-                val, _ = decoder.raw_decode(text[i:])
-            except ValueError:
-                continue
-            if isinstance(val, dict):
-                return val
+    positions = [i for i, ch in enumerate(text) if ch == "{"]
+    for i in reversed(positions):
+        try:
+            val, _ = decoder.raw_decode(text[i:])
+        except ValueError:
+            continue
+        if isinstance(val, dict):
+            return val
     return None
 
 
@@ -322,7 +328,7 @@ def run_verifier(candidates, read_file, api_key):
 
     def one(finding):
         lines = read_file(finding["file"])
-        if lines:
+        if lines and finding["line"] <= len(lines):
             windows = merge_windows([(finding["line"], finding["line"])],
                                     WINDOW_PAD, len(lines))
             code = format_windows(finding["file"], lines, windows)
@@ -380,6 +386,9 @@ def main(argv):
         return 0
     except ReviewError as e:
         print(json.dumps({"error": str(e)}))
+        return 1
+    except Exception as e:
+        print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
         return 1
 
 
@@ -448,10 +457,20 @@ def self_test():
 
     big_lines = [f"l{i}" for i in range(1, 20_001)]
     big = {f"f{n}.py": [(1000, 1001)] for n in range(60)}
-    ctx, truncated = build_context("D" * 30_000, big, lambda p: big_lines)
+    ctx, truncated = build_context("D" * 70_000, big, lambda p: big_lines)
     assert truncated
-    assert len(ctx) <= CONTEXT_BUDGET + 30_000 + 200   # diff always kept
+    # invariant: once over budget, diff (kept in full here since 70k <
+    # CONTEXT_BUDGET) + retained block chars stays within CONTEXT_BUDGET
+    # plus a small fixed header/separator overhead -- only a meaningful
+    # check if the drop-largest-block loop actually ran.
+    assert len(ctx) <= CONTEXT_BUDGET + 300
+    assert ctx.count("=== f") < 60             # some file blocks were dropped
     assert "D" * 100 in ctx
+
+    # diff itself exceeds CONTEXT_BUDGET -> capped with an explicit marker
+    ctx, truncated = build_context("D" * 500_000, {}, lambda p: [])
+    assert truncated is True
+    assert len(ctx) < CONTEXT_BUDGET + 1000
 
     missing = {"api/users.py": [(2, 3)], "moved.py": [(1, 1)]}
     ctx, _ = build_context("DIFFTEXT", missing,
@@ -483,7 +502,7 @@ def self_test():
                for f in good)
     assert normalize_findings("not a list", "security") == ([], 0)
 
-    for role in ROLES:
+    for role in ROLES + ("verifier",):
         assert load_prompt(role).strip(), f"prompt {role}.md missing or empty"
 
     # -- Task 4: dedupe + verdicts --------------------------------------
@@ -500,11 +519,15 @@ def self_test():
     ])
     assert len(deduped) == 3, deduped
     merged = next(f for f in deduped if f["category"] == "correctness"
-                  and f["line"] == 10)
+                  and f["line"] == 11)            # newcomer's whole record wins
     assert merged["severity"] == "high"
 
     assert extract_json_object('ok {"verified": true} done') == {"verified": True}
     assert extract_json_object('nothing here') is None
+    assert extract_json_object(
+        '<think>maybe {"verified": true, "confidence": 0.95}</think>\n'
+        '{"verified": false, "confidence": 0.1, "note": "not real"}'
+    ) == {"verified": False, "confidence": 0.1, "note": "not real"}
 
     f = apply_verdict(mk("a.py", 1, "high", "correctness"),
                       {"verified": True, "confidence": 0.94, "note": "solid"})

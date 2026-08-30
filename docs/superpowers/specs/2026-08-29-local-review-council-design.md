@@ -80,8 +80,10 @@ review.py [git-diff-args...]
   (merged when overlapping), with line numbers. Whole file if ≤400 lines.
 - Total context budget: ~80 KB of prompt text (≈20K tokens, safe inside the
   32K window with room for output). When over budget, shrink windows to ±20
-  lines, then drop file content (keep the diff) for the largest files first,
-  noting `"context_truncated": true` in output stats.
+  lines, then drop file content for the largest files first, noting
+  `"context_truncated": true` in output stats. The diff itself is also capped
+  at `CONTEXT_BUDGET` chars (with an explicit `[diff truncated]` marker) so a
+  pathologically large diff can't blow the budget on its own.
 - Binary files and lockfiles (`*.lock`, `package-lock.json`, etc.) excluded
   from file context; their diff hunks are dropped too.
 
