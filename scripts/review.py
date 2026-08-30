@@ -81,6 +81,94 @@ def read_repo_file(path):
         return None
 
 
+def parse_diff(diff_text):
+    """Split a unified diff into per-file segments, dropping binary and
+    excluded (lockfile) segments entirely. Returns (clean_diff, hunks) where
+    hunks maps new-side path -> [(start, end), ...] 1-based inclusive ranges.
+    Deleted files (+++ /dev/null) stay in clean_diff but get no hunks entry."""
+    kept, hunks = [], {}
+    segment, new_path, old_path, ranges, binary = [], None, None, [], False
+
+    def flush():
+        nonlocal segment, new_path, old_path, ranges, binary
+        path = new_path or old_path
+        if segment and path and not binary and not is_excluded(path):
+            kept.append("".join(segment))
+            if new_path and ranges:
+                hunks.setdefault(new_path, []).extend(ranges)
+        segment, new_path, old_path, ranges, binary = [], None, None, [], False
+
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            flush()
+        segment.append(line)
+        if line.startswith("+++ b/"):
+            new_path = line[6:].strip()
+        elif line.startswith("--- a/"):
+            old_path = line[6:].strip()
+        elif line.startswith("Binary files"):
+            binary = True
+        elif line.startswith("@@ "):
+            plus = line.split("+", 1)[1].split(" ", 1)[0]      # "start,count" or "start"
+            start = int(plus.split(",")[0])
+            count = int(plus.split(",")[1]) if "," in plus else 1
+            ranges.append((start, max(start, start + count - 1)))
+    flush()
+    return "".join(kept), hunks
+
+
+def merge_windows(ranges, pad, total_lines):
+    """Pad ranges, clamp to [1, total_lines], merge overlapping/adjacent."""
+    spans = sorted([max(1, s - pad), min(total_lines, e + pad)] for s, e in ranges)
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [tuple(m) for m in merged]
+
+
+def format_windows(path, lines, windows):
+    parts = [f"=== {path} ==="]
+    for s, e in windows:
+        parts.append(f"--- lines {s}-{e} ---")
+        parts.extend(f"{i}: {lines[i - 1]}" for i in range(s, e + 1))
+    return "\n".join(parts)
+
+
+def build_context(diff_text, hunks, read_file):
+    """Diff + changed-file windows under CONTEXT_BUDGET.
+    Over budget: shrink pads to SHRUNK_PAD, then drop largest file blocks.
+    The diff itself is always kept. Returns (context, truncated)."""
+    entries = []
+    for path in sorted(hunks):
+        lines = read_file(path)
+        if lines is not None:
+            entries.append((path, lines, hunks[path]))
+
+    def render(pad):
+        blocks = []
+        for path, lines, ranges in entries:
+            if len(lines) <= WHOLE_FILE_MAX:
+                windows = [(1, len(lines))] if lines else []
+            else:
+                windows = merge_windows(ranges, pad, len(lines))
+            blocks.append(format_windows(path, lines, windows))
+        return blocks
+
+    truncated = False
+    blocks = render(WINDOW_PAD)
+    if len(diff_text) + sum(map(len, blocks)) > CONTEXT_BUDGET:
+        truncated = True
+        blocks = render(SHRUNK_PAD)
+        while blocks and len(diff_text) + sum(map(len, blocks)) > CONTEXT_BUDGET:
+            blocks.remove(max(blocks, key=len))
+    context = ("## Diff\n" + diff_text +
+               "\n\n## Changed file context (line-numbered)\n" + "\n\n".join(blocks))
+    return context, truncated
+
+
 def main(argv):
     if argv[:1] == ["--self-test"]:
         return self_test()
@@ -114,6 +202,64 @@ def self_test():
     assert is_excluded("poetry.lock")
     assert not is_excluded("src/lock.py")
     assert not is_excluded("api/users.py")
+
+    # -- Task 2: diff parsing + windows + budget ------------------------
+    sample_diff = (
+        "diff --git a/api/users.py b/api/users.py\n"
+        "index 111..222 100644\n"
+        "--- a/api/users.py\n"
+        "+++ b/api/users.py\n"
+        "@@ -10,3 +10,4 @@ def get_user():\n"
+        " a\n-b\n+b2\n+b3\n a\n"
+        "@@ -40,2 +41,2 @@ def list_users():\n"
+        " x\n-y\n+y2\n"
+        "diff --git a/package-lock.json b/package-lock.json\n"
+        "--- a/package-lock.json\n"
+        "+++ b/package-lock.json\n"
+        "@@ -1,1 +1,1 @@\n-old\n+new\n"
+        "diff --git a/logo.png b/logo.png\n"
+        "index 333..444 100644\n"
+        "Binary files a/logo.png and b/logo.png differ\n"
+        "diff --git a/gone.py b/gone.py\n"
+        "deleted file mode 100644\n"
+        "--- a/gone.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n-dead\n-code\n"
+    )
+    clean, hunks = parse_diff(sample_diff)
+    assert list(hunks) == ["api/users.py"], hunks
+    assert hunks["api/users.py"] == [(10, 13), (41, 42)], hunks
+    assert "package-lock.json" not in clean and "logo.png" not in clean
+    assert "gone.py" in clean          # deletions stay visible in the diff
+    assert "api/users.py" in clean
+
+    assert merge_windows([(10, 13), (41, 42)], 80, 500) == [(1, 122)]
+    assert merge_windows([(10, 13), (300, 301)], 20, 500) == [(1, 33), (280, 321)]
+    assert merge_windows([(490, 495)], 80, 500) == [(410, 500)]
+
+    lines = [f"code line {i}" for i in range(1, 6)]
+    block = format_windows("api/users.py", lines, [(2, 4)])
+    assert "=== api/users.py ===" in block
+    assert "2: code line 2" in block and "4: code line 4" in block
+    assert "1: code line 1" not in block and "5:" not in block
+
+    small = {"api/users.py": [(2, 3)]}
+    reader = lambda p: lines                      # 5-line file -> included whole
+    ctx, truncated = build_context("DIFFTEXT", small, reader)
+    assert not truncated
+    assert "DIFFTEXT" in ctx and "1: code line 1" in ctx and "5: code line 5" in ctx
+
+    big_lines = [f"l{i}" for i in range(1, 20_001)]
+    big = {f"f{n}.py": [(1000, 1001)] for n in range(60)}
+    ctx, truncated = build_context("D" * 30_000, big, lambda p: big_lines)
+    assert truncated
+    assert len(ctx) <= CONTEXT_BUDGET + 30_000 + 200   # diff always kept
+    assert "D" * 100 in ctx
+
+    missing = {"api/users.py": [(2, 3)], "moved.py": [(1, 1)]}
+    ctx, _ = build_context("DIFFTEXT", missing,
+                           lambda p: lines if p == "api/users.py" else None)
+    assert "moved.py" not in ctx.split("DIFFTEXT")[1]  # unreadable file skipped
 
     print("self-test OK", file=sys.stderr)
     return 0
