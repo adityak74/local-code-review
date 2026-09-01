@@ -33,7 +33,9 @@ After the findings, report the rejection line, e.g.
 If `stats.graph` is present, add one line of routing facts, e.g.
 "Code graph routed N changed symbols, M impacted, K untested." — and if
 `untested_changed` > 0, mention that some changed symbols have no test
-coverage.
+coverage. If `stats.graph.crg` is present, non-Python files were routed by
+the optional external `code-review-graph`; fold its `changed_symbols` into
+the same line.
 If `findings` is empty, say the council found nothing verifiable — do NOT
 add review comments of your own. Never invent findings beyond the JSON.
 If `stats.failed_reviewers` is non-empty or `stats.context_truncated` is

@@ -2,14 +2,16 @@
 """Local Review Council engine: git diff -> code graph routing -> parallel
 role reviewers -> verifier -> JSON.
 
-A deterministic first pass (codegraph.py: AST symbol graph, blast radius,
-risk ranking) decides WHERE to look; the local oMLX council decides whether
-there is actually a bug. Stdlib only.
+A deterministic first pass decides WHERE to look; the local oMLX council
+decides whether there is actually a bug. The first pass is codegraph.py (AST
+symbol graph, blast radius, risk ranking; stdlib only) for Python, plus the
+external `code-review-graph` CLI for other languages when it is installed.
 Specs: docs/superpowers/specs/2026-08-29-local-review-council-design.md
        docs/superpowers/specs/2026-08-30-graph-routing-layer-design.md
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,7 @@ SYMBOL_PAD = 5            # pad around symbol spans (already semantic units)
 WHOLE_FILE_MAX = 400      # files at or under this many lines are included whole
 MAX_WORKERS = 8           # matches oMLX max_concurrent_requests
 REQUEST_TIMEOUT = int(os.environ.get("LOCAL_REVIEW_REQUEST_TIMEOUT", 300))  # seconds per model call
+CRG_TIMEOUT = 60          # seconds for the external code-review-graph call
 SKILL_DIR = Path(__file__).resolve().parent.parent
 EXCLUDED_NAMES = {"package-lock.json", "pnpm-lock.yaml"}
 
@@ -221,8 +224,8 @@ def build_context(diff_text, hunks, read_file, analysis=None):
     return "\n\n".join(parts), truncated
 
 
-def graph_analysis(hunks):
-    """Deterministic first pass (codegraph) over the .py hunks. Returns the
+def ast_analysis(hunks):
+    """Routing pass over the .py hunks (codegraph, stdlib ast). Returns the
     analysis dict or None; any failure degrades to v0 hunk windows — the
     routing layer must never kill a review."""
     py_hunks = {p: r for p, r in hunks.items() if p.endswith(".py")}
@@ -244,6 +247,94 @@ def graph_analysis(hunks):
         warn(f"code graph failed ({type(e).__name__}: {e}); "
              "falling back to hunk windows")
         return None
+
+
+
+def crg_report(data, hunks, root):
+    """Normalize `code-review-graph detect-changes` JSON into the analysis
+    contract. Only symbols overlapping lines OUR diff actually touched are
+    kept — the external graph may be stale or built against a different base,
+    and a wrong symbol is worse than no symbol. Returns None if none survive."""
+    gaps = {g.get("qualified_name") for g in data.get("test_gaps", ())}
+    rows = []
+    for f in data.get("changed_functions", ()):
+        path = os.path.relpath(f.get("file_path") or "", root)
+        start, end = f.get("line_start"), f.get("line_end")
+        ranges = hunks.get(path)
+        if not ranges or start is None or end is None:
+            continue
+        if not any(s <= end and start <= e for s, e in ranges):
+            continue
+        rows.append((round(float(f.get("risk_score") or 0.0), 2), path,
+                     (start, end), f.get("name") or "?",
+                     "no test reaches it" if f.get("qualified_name") in gaps
+                     else "changed symbol"))
+    if not rows:
+        return None
+    rows.sort(key=lambda r: (-r[0], r[1], r[2]))
+
+    lines = ["## Impact analysis (code-review-graph, non-Python files)",
+             "Changed symbols by risk:"]
+    spans = {}
+    for risk, path, (start, end), name, reason in rows:
+        lines.append(f"- {codegraph.bucket(risk).upper()} {risk:.2f} "
+                     f"{path}:{start}-{end} {name} — {reason}")
+        spans.setdefault(path, []).append((start, end))
+
+    # Same rule as codegraph.analyze: symbol spans plus any touched range no
+    # span fully covers, so top-level edits never drop out of the context.
+    file_ranges = {}
+    for path, sp in spans.items():
+        leftover = [(s, e) for s, e in hunks[path]
+                    if not any(a <= s and e <= b for a, b in sp)]
+        file_ranges[path] = codegraph._merge(sp + leftover)
+    return {"report": "\n".join(lines), "file_ranges": file_ranges,
+            "extra_blocks": [],
+            "stats": {"crg": {"changed_symbols": len(rows),
+                              "files": len(file_ranges)}}}
+
+
+def crg_analysis(hunks, base):
+    """Optional routing pass for the files codegraph cannot parse, delegated
+    to the external code-review-graph CLI (tree-sitter, 40+ languages) against
+    the graph it already keeps in .code-review-graph/. Read-only: it never
+    builds or updates the graph here. Absent, disabled, ungraphed or slow ->
+    None, and those files keep v0 hunk windows."""
+    other = {p: r for p, r in hunks.items() if not p.endswith(".py")}
+    exe = shutil.which("code-review-graph")
+    if (not other or not exe or base.startswith("-")
+            or os.environ.get("LOCAL_REVIEW_CRG", "1") == "0"):
+        return None
+    try:
+        proc = subprocess.run([exe, "detect-changes", "--base", base],
+                              cwd=repo_root(), capture_output=True, text=True,
+                              timeout=CRG_TIMEOUT)
+        if proc.returncode != 0:
+            raise ReviewError(proc.stderr.strip()[-200:] or "detect-changes failed")
+        analysis = crg_report(json.loads(proc.stdout), other, repo_root())
+    except Exception as e:
+        warn(f"code-review-graph skipped ({type(e).__name__}: {e}); "
+             "non-Python files keep hunk windows")
+        return None
+    if analysis:
+        st = analysis["stats"]["crg"]
+        warn(f"code-review-graph: {st['changed_symbols']} changed symbol(s) in "
+             f"{st['files']} non-Python file(s)")
+    return analysis
+
+
+def graph_analysis(hunks, base="HEAD"):
+    """Both routing passes, either of which may be absent: codegraph for .py,
+    code-review-graph for the rest. Their file_ranges are disjoint by
+    construction. Both absent -> None -> v0 hunk windows."""
+    parts = [a for a in (ast_analysis(hunks), crg_analysis(hunks, base)) if a]
+    if len(parts) < 2:
+        return parts[0] if parts else None
+    py, crg = parts
+    return {"report": py["report"] + "\n\n" + crg["report"],
+            "file_ranges": {**py["file_ranges"], **crg["file_ranges"]},
+            "extra_blocks": py["extra_blocks"] + crg["extra_blocks"],
+            "stats": {**py["stats"], **crg["stats"]}}
 
 
 ROLES = ("correctness", "security", "regression")
@@ -440,7 +531,7 @@ def main(argv):
         if not clean_diff.strip():
             print(json.dumps({"findings": [], "note": "nothing to review"}))
             return 0
-        analysis = graph_analysis(hunks)
+        analysis = graph_analysis(hunks, argv[0] if argv else "HEAD")
         context, truncated = build_context(clean_diff, hunks, read_repo_file, analysis)
         warn(f"reviewing {len(hunks)} file(s), context {len(context)} chars")
         candidates, malformed, failed_roles = run_council(context, api_key)
@@ -591,6 +682,31 @@ def self_test():
     assert len(ctx) <= CONTEXT_BUDGET + 300
     assert "=== big.py ===" in ctx                 # changed context survives
     assert ctx.count("=== c") < 60                 # most blast blocks dropped
+
+    # -- code-review-graph adapter (non-Python routing) -----------------
+    root, crg_hunks = "/repo", {"app/main.ts": [(12, 14), (300, 300)]}
+    data = {
+        "changed_functions": [
+            {"name": "handler", "qualified_name": "q1", "risk_score": 0.7,
+             "file_path": "/repo/app/main.ts", "line_start": 10, "line_end": 20},
+            {"name": "stale", "qualified_name": "q2", "risk_score": 0.9,
+             "file_path": "/repo/app/main.ts", "line_start": 90, "line_end": 95},
+            {"name": "elsewhere", "qualified_name": "q3", "risk_score": 0.9,
+             "file_path": "/repo/other.ts", "line_start": 1, "line_end": 9},
+        ],
+        "test_gaps": [{"qualified_name": "q1"}],
+    }
+    crg = crg_report(data, crg_hunks, root)
+    assert crg["stats"]["crg"] == {"changed_symbols": 1, "files": 1}
+    assert "app/main.ts:10-20 handler — no test reaches it" in crg["report"]
+    assert "stale" not in crg["report"]          # no overlap with touched lines
+    assert "elsewhere" not in crg["report"]      # file not in this diff
+    # symbol span replaces the hunk it covers; the uncovered hunk survives
+    assert crg["file_ranges"] == {"app/main.ts": [(10, 20), (300, 300)]}
+    assert crg["extra_blocks"] == []
+    assert crg_report({"changed_functions": []}, crg_hunks, root) is None
+    assert crg_analysis({"a.py": [(1, 1)]}, "HEAD") is None   # no non-.py files
+    assert crg_analysis(crg_hunks, "--cached") is None        # not a rev
 
     # -- Task 3: JSON extraction + finding normalization ----------------
     assert extract_json_array('noise [1, 2] tail') == [1, 2]

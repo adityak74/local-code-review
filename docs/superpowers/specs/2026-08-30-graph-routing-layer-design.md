@@ -125,9 +125,9 @@ to the output JSON when the graph path ran.
 
 ## Explicitly not doing (and why)
 
-- **No tree-sitter / multi-language symbol graph.** Stdlib-only is a README
-  promise. Non-Python files keep v0 hunk windows; the fallback IS the
-  multi-language story until a real need appears.
+- **No tree-sitter / multi-language symbol graph of our own.** Stdlib-only is
+  a README promise. Non-Python files keep v0 hunk windows — amended
+  2026-08-31, see below: an already-installed external graph may fill in.
 - **No SQLite persistence / incremental index.** A full `ast.parse` of a
   ≤2000-file repo is seconds; caching earns its place when someone measures it.
 - **No betweenness centrality, communities, flow criticality.** Fan-in, tests,
@@ -144,3 +144,38 @@ mapping, blast-radius membership and ordering, risk ordering (untested >
 tested, security-named > plain), and report rendering.
 `review.py --self-test` runs it plus integration asserts (graph context
 sections present for Python, v0 fallback for non-Python and on failure).
+
+
+## Amendment 2026-08-31 — optional `code-review-graph` adapter
+
+Multi-language routing arrived as a *delegation*, not a build. When the
+external [`code-review-graph`](https://github.com/tirth8205/code-review-graph)
+CLI is on `PATH` and has a graph for the repo, `crg_analysis()` shells out to
+`detect-changes --base <base>` and `crg_report()` normalizes the JSON into the
+existing analysis contract (`report`, `file_ranges`, `extra_blocks`, `stats`).
+`graph_analysis()` merges the two passes; their `file_ranges` are disjoint by
+construction (`.py` vs everything else).
+
+Binding constraints:
+
+- **Python is never delegated.** `codegraph.py` is more precise on `.py` —
+  it seeds from touched lines, not whole files, and it is the only source of
+  blast radius. The adapter covers non-`.py` files only, and contributes no
+  `extra_blocks`.
+- **Trust nothing that does not overlap our own diff.** The external graph
+  may be stale or built against a different base. Every reported symbol is
+  intersected with the lines `parse_diff` recorded as touched; non-overlapping
+  symbols are dropped. A wrong symbol is worse than no symbol.
+- **Symbol spans never swallow a hunk.** As in `analyze()`, touched ranges no
+  span fully covers are kept alongside the spans, so top-level edits survive.
+- **Read-only.** The engine calls `detect-changes` only; it never runs
+  `build`, `update`, or `watch`, and never writes `.code-review-graph/`.
+  Keeping that graph fresh is the user's business.
+- **Still optional.** Not installed, no graph, non-zero exit, bad JSON, over
+  `CRG_TIMEOUT` (60s), a `--`-prefixed diff spec, or `LOCAL_REVIEW_CRG=0` →
+  `None` and those files keep hunk windows. The engine stays stdlib-only; the
+  dependency is one the user either already has or does not.
+
+`stats.graph.crg` is added when the adapter contributed. `crg_report` is pure
+and self-tested on a fixture: overlap filtering, stale-symbol rejection,
+foreign-file rejection, test-gap reasons, leftover-hunk preservation.

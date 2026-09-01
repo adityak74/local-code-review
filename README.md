@@ -47,6 +47,8 @@ Claude Code ──► /local-review ──► review.py
                           code graph (codegraph.py)
                      AST symbols · calls · imports ·
                      inheritance · tests  — stdlib ast
+                     + code-review-graph for non-Python
+                       files, when it is installed
                                      │
                           blast radius + risk ranking
                        changed symbols → callers → tests
@@ -69,7 +71,11 @@ Claude Code ──► /local-review ──► review.py
                     Claude explains · fixes · comments
 ```
 
-The entire engine is **two stdlib-only Python files**: `codegraph.py` (the deterministic intelligence — no LLM, no HTTP) and `review.py` (orchestration + oMLX council). No pip installs, no venv, no framework. `SKILL.md` is a thin UX layer; the deterministic pipeline lives in Python where it belongs.
+The entire engine is **two stdlib-only Python files**: `codegraph.py` (the deterministic intelligence — no LLM, no HTTP) and `review.py` (orchestration + oMLX council). No pip installs, no venv, no framework.
+
+Python is routed by `codegraph.py`. For **other languages**, the engine will use [`code-review-graph`](https://github.com/tirth8205/code-review-graph) as a second routing source if you happen to have it installed and built (`pip install code-review-graph && code-review-graph build`) — it parses 40+ languages via tree-sitter and keeps a persistent graph in `.code-review-graph/`. It is strictly optional and read-only: the engine never builds or updates that graph, only reads it, and every symbol it reports is intersected with the lines your diff actually touched before it is trusted. Absent, unbuilt, stale, or slow → those files keep hunk windows. Disable with `LOCAL_REVIEW_CRG=0`.
+
+`SKILL.md` is a thin UX layer; the deterministic pipeline lives in Python where it belongs.
 
 ## Quickstart
 
@@ -172,7 +178,8 @@ Reviewer behavior lives in plain-markdown prompts (`skills/review/prompts/*.md`)
     "context_truncated": false, "malformed_dropped": 0, "failed_reviewers": [],
     "graph": {
       "files_indexed": 212, "parse_failures": 0, "symbols": 1840,
-      "changed_symbols": 3, "impacted_symbols": 11, "untested_changed": 1
+      "changed_symbols": 3, "impacted_symbols": 11, "untested_changed": 1,
+      "crg": { "changed_symbols": 2, "files": 1 }
     }
   }
 }
@@ -180,7 +187,8 @@ Reviewer behavior lives in plain-markdown prompts (`skills/review/prompts/*.md`)
 
 `stats.graph` appears when the deterministic first pass ran (the diff touched
 Python files); if the graph fails for any reason the engine falls back to plain
-hunk windows and reviews anyway.
+hunk windows and reviews anyway. `stats.graph.crg` appears only when
+`code-review-graph` also contributed routing for non-Python files.
 
 On an empty diff, it short-circuits to `{"findings": [], "note": "nothing to
 review"}` — no `rejected_count` or `stats` keys. On a fatal error (git failure,
@@ -211,7 +219,7 @@ The Claude Code skill is the first distribution surface, not the architecture. T
 
 ## Known limitations
 
-- The symbol graph is Python-only (stdlib `ast`); other languages fall back to hunk-window context. Call/inheritance edges are name-based — ambiguous bare names are deliberately dropped, never guessed, so dynamic dispatch and duplicate names thin the blast radius.
+- The built-in symbol graph is Python-only (stdlib `ast`). Other languages get symbol routing only when the optional `code-review-graph` is installed and built, and even then only risk-ranked changed symbols — blast radius stays Python-only. Without it they fall back to hunk-window context. Call/inheritance edges are name-based — ambiguous bare names are deliberately dropped, never guessed, so dynamic dispatch and duplicate names thin the blast radius.
 - Pure renames and git-quoted paths are skipped by the diff parser.
 - The same bug flagged by two categories surfaces as two findings — dedupe is per-category by design.
 - Diff content is not defended against prompt injection; don't point it at untrusted PRs expecting adversarial robustness.
