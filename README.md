@@ -1,16 +1,33 @@
+<div align="center">
+
 # Local Review Council
 
-**A 100% local, parallel, evidence-verified code review council for Claude Code — powered by [oMLX](https://github.com/jundot/omlx) on Apple Silicon.**
+**The code review platform that runs entirely on your laptop.**
 
-[![Status](https://img.shields.io/badge/status-v0-brightgreen)](docs/superpowers/specs/2026-08-29-local-review-council-design.md)
+A parallel council of local AI reviewers — correctness, security, regression — routed by a
+deterministic code graph and gated by a skeptical verifier. No cloud. No API bill. No PR required.
+
+[![Status](https://img.shields.io/badge/status-v1-brightgreen)](docs/superpowers/specs/2026-08-30-graph-routing-layer-design.md)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)](#how-it-works)
 [![Platform](https://img.shields.io/badge/platform-Apple_Silicon-black)](#requirements)
+[![Cost](https://img.shields.io/badge/cost-%240%2Fmonth-brightgreen)](#vs-hosted-review-platforms)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-One command runs your diff through a **deterministic code graph** (AST symbol index → blast radius → risk ranking) that decides *where to look*, routes only the relevant functions, callers, and tests to **three specialized local reviewers in parallel** — correctness, security, regression — then a **skeptical verifier** re-examines every candidate finding against the actual code. Only findings that survive verification reach you. Your code never leaves your machine.
+[Quickstart](#quickstart) · [How it works](#how-it-works) · [vs. CodeRabbit](#vs-hosted-review-platforms) · [Any agent](#use-it-with-any-coding-agent) · [Output contract](#output-contract)
 
-The graph layer answers *"where should we look?"*; the LLM layer answers *"is there actually a bug, why, and how confident are we?"* — deterministic code intelligence as the routing layer for a fast ensemble of MLX reviewers, not another generic LLM PR reviewer.
+</div>
+
+---
+
+CodeRabbit, Greptile, Qodo and friends solved AI code review — then put it behind a seat price, a
+GitHub App, and a copy of your source on someone else's servers. This does the same job on your own
+machine, on your own diff, before the PR exists.
+
+One command runs your diff through a **deterministic code graph** (AST symbol index → blast radius →
+risk ranking) that decides *where to look*, routes only the relevant functions, callers and tests to
+**three specialized local reviewers in parallel**, then a **skeptical verifier** re-examines every
+candidate finding against the actual code. Only findings that survive verification reach you.
 
 ```text
 > /local-review --staged
@@ -28,54 +45,95 @@ MEDIUM  api/users.py:71
 3 candidate findings rejected by verifier.
 ```
 
-That last line is the point: this is not another LLM spraying review comments. Every finding is independently re-verified, and the rejects are counted in the open.
+That last line is the point. Hosted reviewers are scored on how much they say; this one is scored on
+what it can defend. Every finding is independently re-verified against the code, and the rejects are
+counted in the open.
 
-## Why
+## Why this exists
 
-- **Private.** The diff, the context, the findings — everything stays on your Mac, as long as `OMLX_BASE_URL` points at a local server. Nothing is sent to any cloud.
-- **Parallel.** Three reviewers hit oMLX's continuous-batching server simultaneously; one loaded model serves the whole council at aggregate throughput a sequential loop can't touch.
-- **Verified.** A dedicated verifier pass adversarially re-checks each candidate against the real code and rejects anything speculative (confidence gate: 0.80).
-- **Honest architecture.** Claude Code is the interface and action layer; the local models are the analysis engine. Claude runs *one* command and interprets *one* JSON object — it never puppeteers the review micro-steps.
+|  | |
+|---|---|
+| 🔒 **Actually private** | The diff, the context, the findings — all of it stays on your Mac. Nothing is sent anywhere, so nothing needs a DPA, a vendor review, or a security exception. |
+| ⚡ **Parallel, not sequential** | Three reviewers hit oMLX's continuous-batching server simultaneously. One loaded model serves the whole council at aggregate throughput a for-loop can't touch. |
+| 🎯 **Routed, not sprayed** | A stdlib-`ast` code graph picks the context: changed symbols, their callers, their tests, risk-ranked to a budget. The LLM sees what matters, not the first N KB of diff. |
+| 🧪 **Verified, not asserted** | A dedicated adversarial pass re-checks every candidate against the real code and drops anything speculative (confidence gate: 0.80). |
+| 💸 **$0 forever** | No seats, no per-PR pricing, no token meter. Your laptop is the whole bill. |
+| 🧩 **Not Claude-only** | It's a script that prints one JSON object. Claude Code, Codex, Cursor, Copilot, or a bash loop — all first-class. |
+
+## vs. hosted review platforms
+
+| | **Local Review Council** | CodeRabbit / Greptile / Qodo |
+|---|---|---|
+| **Cost** | $0 — runs on hardware you own | $15–40 per seat / month |
+| **Where your code goes** | Nowhere. `localhost:8000` | Uploaded to the vendor's cloud |
+| **When you can review** | Any time — uncommitted, staged, or a branch | After you push and open a PR |
+| **Works offline** | Yes | No |
+| **Context selection** | Deterministic code graph: blast radius + risk ranking | Vendor-internal retrieval |
+| **False-positive control** | Explicit verifier pass; rejects reported in the open | Tunable filters, opaque |
+| **Prompts** | Plain markdown you can edit | Vendor-controlled |
+| **Runs in your agent** | Any agent that can run a shell command | GitHub/GitLab PR comments |
+| **Language coverage** | Python graph built in; 40+ via optional adapter | Broad, out of the box |
+| **Setup** | `omlx start` + one plugin install | OAuth a GitHub App |
+| **Team dashboards, PR bots, SSO** | ✗ | ✓ |
+
+**Where hosted tools still win:** org-wide dashboards, PR-thread automation, SSO/compliance
+reporting, and broad language coverage with zero setup. This is not a drop-in replacement for a
+platform contract — it's the review you run *before* the PR, on the diff nobody else has seen yet.
 
 ## How it works
 
-```text
-Claude Code ──► /local-review ──► review.py
-                                     │
-                                  git diff
-                                     │
-                          code graph (codegraph.py)
-                     AST symbols · calls · imports ·
-                     inheritance · tests  — stdlib ast
-                     + code-review-graph for non-Python
-                       files, when it is installed
-                                     │
-                          blast radius + risk ranking
-                       changed symbols → callers → tests
-                                     │
-                          route ONLY relevant context
-                     impact report + symbol bodies + blast
-                     radius code, risk-budgeted
-                                     │
-                     ┌───────────────┼───────────────┐
-                     ▼               ▼               ▼
-                correctness      security        regression
-                     └───────────────┼───────────────┘
-                                     ▼   oMLX · continuous batching
-                                 verifier    localhost:8000
-                                     │
-                                     ▼
-                          verified JSON findings
-                                     │
-                                     ▼
-                    Claude explains · fixes · comments
+```mermaid
+flowchart TD
+    A["Claude Code / any agent<br/>/local-review"] --> B["review.py · git diff"]
+    B --> D["<b>codegraph.py</b> — deterministic, no LLM<br/>AST symbols · calls · imports · inheritance · tests"]
+    D -.->|non-Python files, if installed| E["code-review-graph<br/>tree-sitter, 40+ languages"]
+    E -.-> F
+    D --> F["blast radius + risk ranking<br/>changed symbols → callers → tests"]
+    F --> G["route ONLY relevant context<br/>impact report + symbol bodies, risk-budgeted"]
+    G --> H["correctness"]
+    G --> I["security"]
+    G --> J["regression"]
+    H --> K["<b>verifier</b><br/>adversarial re-check vs. real code"]
+    I --> K
+    J --> K
+    K --> L["verified JSON findings<br/>+ rejected_count"]
+    L --> M["agent explains · fixes · comments"]
+
+    subgraph OMLX ["oMLX · continuous batching · 127.0.0.1:8000"]
+        H
+        I
+        J
+        K
+    end
+
+    style D fill:#1f6f3f,stroke:#0d3d22,color:#fff
+    style F fill:#1f6f3f,stroke:#0d3d22,color:#fff
+    style K fill:#7a3ea1,stroke:#43205c,color:#fff
+    style L fill:#1d4ed8,stroke:#102a6b,color:#fff
 ```
 
-The entire engine is **two stdlib-only Python files**: `codegraph.py` (the deterministic intelligence — no LLM, no HTTP) and `review.py` (orchestration + oMLX council). No pip installs, no venv, no framework.
+The graph layer answers *"where should we look?"*; the LLM layer answers *"is there actually a bug,
+why, and how confident are we?"* Deterministic code intelligence as the routing layer for a fast
+ensemble of local reviewers — not another generic LLM spraying PR comments.
 
-Python is routed by `codegraph.py`. For **other languages**, the engine will use [`code-review-graph`](https://github.com/tirth8205/code-review-graph) as a second routing source if you happen to have it installed and built (`pip install code-review-graph && code-review-graph build`) — it parses 40+ languages via tree-sitter and keeps a persistent graph in `.code-review-graph/`. It is strictly optional and read-only: the engine never builds or updates that graph, only reads it, and every symbol it reports is intersected with the lines your diff actually touched before it is trusted. Absent, unbuilt, stale, or slow → those files keep hunk windows. Disable with `LOCAL_REVIEW_CRG=0`.
+The entire engine is **two stdlib-only Python files**: `codegraph.py` (the deterministic
+intelligence — no LLM, no HTTP) and `review.py` (orchestration + oMLX council). No pip installs, no
+venv, no framework. `SKILL.md` is a thin UX layer; the pipeline lives in Python where it belongs.
 
-`SKILL.md` is a thin UX layer; the deterministic pipeline lives in Python where it belongs.
+### Multi-language routing (optional)
+
+Python is routed by `codegraph.py`. For **other languages**, the engine will use
+[`code-review-graph`](https://github.com/tirth8205/code-review-graph) as a second routing source if
+you happen to have it installed and built:
+
+```bash
+pip install code-review-graph && code-review-graph build   # optional, 40+ languages via tree-sitter
+```
+
+It is strictly optional and read-only: the engine never builds or updates that graph, only reads it,
+and every symbol it reports is intersected with the lines your diff actually touched before it is
+trusted. Absent, unbuilt, stale, or slow → those files keep hunk windows. Disable with
+`LOCAL_REVIEW_CRG=0`.
 
 ## Quickstart
 
@@ -100,7 +158,7 @@ git clone https://github.com/adityak74/local-code-review.git ~/Projects/local-co
 ln -sfn ~/Projects/local-code-review/skills/review ~/.claude/skills/local-review
 ```
 
-**3. Review from Claude Code:**
+**3. Review:**
 
 ```text
 /local-review:review           # plugin install (use /local-review for the symlink install)
@@ -119,7 +177,8 @@ python3 skills/review/scripts/review.py --staged | jq '.findings'
 
 ## Use it with any coding agent
 
-The engine has no Claude dependency — it's one command that prints one JSON object, so any agent that can run shell commands can use it. Paste this block into the instruction file your agent reads:
+The engine has no Claude dependency — it's one command that prints one JSON object, so any agent
+that can run shell commands can use it. Paste this block into the instruction file your agent reads:
 
 ```markdown
 ## Local code review
@@ -148,15 +207,19 @@ Where to paste it:
 
 ## Configuration
 
-Three environment variables. That's all of it.
+Environment variables. That's all of it.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `LOCAL_REVIEW_MODEL` | `lmstudio-community/Qwen3.6-35B-A3B-MLX-4bit` | Model the council uses |
 | `OMLX_BASE_URL` | `http://127.0.0.1:8000` | oMLX server address |
 | `OMLX_API_KEY` | read from `~/.omlx/settings.json` | Auth, if you've enabled it |
+| `LOCAL_REVIEW_CRG` | `1` | Set `0` to disable the optional multi-language adapter |
+| `LOCAL_REVIEW_CONTEXT_BUDGET` | `80000` | Chars of prompt context per reviewer |
+| `LOCAL_REVIEW_REQUEST_TIMEOUT` | `300` | Seconds per model call |
 
-Reviewer behavior lives in plain-markdown prompts (`skills/review/prompts/*.md`) — edit them, no code changes required.
+Reviewer behavior lives in plain-markdown prompts (`skills/review/prompts/*.md`) — edit them, no
+code changes required. That's the whole customization story: no rules DSL, no web console.
 
 ## Output contract
 
@@ -185,33 +248,34 @@ Reviewer behavior lives in plain-markdown prompts (`skills/review/prompts/*.md`)
 }
 ```
 
-`stats.graph` appears when the deterministic first pass ran (the diff touched
-Python files); if the graph fails for any reason the engine falls back to plain
-hunk windows and reviews anyway. `stats.graph.crg` appears only when
-`code-review-graph` also contributed routing for non-Python files.
+`stats.graph` appears when the deterministic first pass ran (the diff touched Python files); if the
+graph fails for any reason the engine falls back to plain hunk windows and reviews anyway.
+`stats.graph.crg` appears only when `code-review-graph` also contributed routing for non-Python
+files.
 
-On an empty diff, it short-circuits to `{"findings": [], "note": "nothing to
-review"}` — no `rejected_count` or `stats` keys. On a fatal error (git failure,
-oMLX unreachable, or anything unexpected), it prints `{"error": "…"}` and
-exits 1.
+On an empty diff, it short-circuits to `{"findings": [], "note": "nothing to review"}` — no
+`rejected_count` or `stats` keys. On a fatal error (git failure, oMLX unreachable, or anything
+unexpected), it prints `{"error": "…"}` and exits 1.
 
 Machine-readable by design — the Claude Code skill is the first consumer, not the only one.
 
 ## Requirements
 
-- Apple Silicon Mac (the council was built on an M-series with 48 GB; smaller models fit smaller machines)
+- Apple Silicon Mac (built on an M-series with 48 GB; smaller models fit smaller machines)
 - Python 3.9+ (stdlib only — no packages)
 - [oMLX](https://github.com/jundot/omlx) serving any instruct model you like
 - git
 
 ## Roadmap
 
-The Claude Code skill is the first distribution surface, not the architecture. The engine is deliberately a standalone JSON-emitting program so more surfaces can wrap it:
+The Claude Code skill is the first distribution surface, not the architecture. The engine is
+deliberately a standalone JSON-emitting program so more surfaces can wrap it:
 
 - [x] Design spec ([docs/superpowers/specs](docs/superpowers/specs/2026-08-29-local-review-council-design.md))
 - [x] v0: council + verifier engine, Claude Code skill
 - [x] Claude Code plugin + self-hosted marketplace (`/local-review:review`)
 - [x] v1: deterministic code graph routing — changed symbols, blast radius, risk ranking ([spec](docs/superpowers/specs/2026-08-30-graph-routing-layer-design.md))
+- [x] Optional multi-language routing via `code-review-graph`
 - [ ] Standalone CLI polish (`local-review` entry point)
 - [ ] MCP server (one reviewer for Claude Code, Codex, OpenCode, Zed, …)
 - [ ] GitHub Action & pre-commit hook
@@ -219,15 +283,27 @@ The Claude Code skill is the first distribution surface, not the architecture. T
 
 ## Known limitations
 
-- The built-in symbol graph is Python-only (stdlib `ast`). Other languages get symbol routing only when the optional `code-review-graph` is installed and built, and even then only risk-ranked changed symbols — blast radius stays Python-only. Without it they fall back to hunk-window context. Call/inheritance edges are name-based — ambiguous bare names are deliberately dropped, never guessed, so dynamic dispatch and duplicate names thin the blast radius.
+Stated up front, because a review tool that hides its blind spots is worse than one that has them:
+
+- The built-in symbol graph is Python-only (stdlib `ast`). Other languages get symbol routing only
+  when the optional `code-review-graph` is installed and built, and even then only risk-ranked
+  changed symbols — blast radius stays Python-only. Without it they fall back to hunk-window
+  context. Call/inheritance edges are name-based — ambiguous bare names are deliberately dropped,
+  never guessed, so dynamic dispatch and duplicate names thin the blast radius.
 - Pure renames and git-quoted paths are skipped by the diff parser.
 - The same bug flagged by two categories surfaces as two findings — dedupe is per-category by design.
-- Diff content is not defended against prompt injection; don't point it at untrusted PRs expecting adversarial robustness.
+- Diff content is not defended against prompt injection; don't point it at untrusted PRs expecting
+  adversarial robustness.
 - No overall wall-clock timeout.
+- Findings are only as good as the local model you serve. A 4-bit 35B council is not GPT-5-class
+  reasoning — it is, however, running on your machine for free while you type.
 
 ## Contributing
 
-Issues and PRs welcome. The design specs and implementation plan live in [`docs/superpowers/`](docs/superpowers/) — read the specs first; they're the binding authority for how the pipeline behaves. Keep the engine stdlib-only: deterministic intelligence in `codegraph.py`, LLM orchestration in `review.py`, and never an LLM call in the first pass.
+Issues and PRs welcome. The design specs and implementation plan live in
+[`docs/superpowers/`](docs/superpowers/) — read the specs first; they're the binding authority for
+how the pipeline behaves. Keep the engine stdlib-only: deterministic intelligence in `codegraph.py`,
+LLM orchestration in `review.py`, and never an LLM call in the first pass.
 
 ## License
 
