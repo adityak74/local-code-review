@@ -8,7 +8,9 @@
 [![Platform](https://img.shields.io/badge/platform-Apple_Silicon-black)](#requirements)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-One command runs your diff through **three specialized local reviewers in parallel** — correctness, security, regression — then a **skeptical verifier** re-examines every candidate finding against the actual code. Only findings that survive verification reach you. Your code never leaves your machine.
+One command runs your diff through a **deterministic code graph** (AST symbol index → blast radius → risk ranking) that decides *where to look*, routes only the relevant functions, callers, and tests to **three specialized local reviewers in parallel** — correctness, security, regression — then a **skeptical verifier** re-examines every candidate finding against the actual code. Only findings that survive verification reach you. Your code never leaves your machine.
+
+The graph layer answers *"where should we look?"*; the LLM layer answers *"is there actually a bug, why, and how confident are we?"* — deterministic code intelligence as the routing layer for a fast ensemble of MLX reviewers, not another generic LLM PR reviewer.
 
 ```text
 > /local-review --staged
@@ -40,8 +42,20 @@ That last line is the point: this is not another LLM spraying review comments. E
 ```text
 Claude Code ──► /local-review ──► review.py
                                      │
-                            git diff + changed-file
-                            context (budgeted windows)
+                                  git diff
+                                     │
+                          code graph (codegraph.py)
+                     AST symbols · calls · imports ·
+                     inheritance · tests  — stdlib ast
+                     + code-review-graph for non-Python
+                       files, when it is installed
+                                     │
+                          blast radius + risk ranking
+                       changed symbols → callers → tests
+                                     │
+                          route ONLY relevant context
+                     impact report + symbol bodies + blast
+                     radius code, risk-budgeted
                                      │
                      ┌───────────────┼───────────────┐
                      ▼               ▼               ▼
@@ -57,7 +71,11 @@ Claude Code ──► /local-review ──► review.py
                     Claude explains · fixes · comments
 ```
 
-The entire engine is **one stdlib-only Python file** (`skills/review/scripts/review.py`). No pip installs, no venv, no framework. `SKILL.md` is a thin UX layer; the deterministic pipeline lives in Python where it belongs.
+The entire engine is **two stdlib-only Python files**: `codegraph.py` (the deterministic intelligence — no LLM, no HTTP) and `review.py` (orchestration + oMLX council). No pip installs, no venv, no framework.
+
+Python is routed by `codegraph.py`. For **other languages**, the engine will use [`code-review-graph`](https://github.com/tirth8205/code-review-graph) as a second routing source if you happen to have it installed and built (`pip install code-review-graph && code-review-graph build`) — it parses 40+ languages via tree-sitter and keeps a persistent graph in `.code-review-graph/`. It is strictly optional and read-only: the engine never builds or updates that graph, only reads it, and every symbol it reports is intersected with the lines your diff actually touched before it is trusted. Absent, unbuilt, stale, or slow → those files keep hunk windows. Disable with `LOCAL_REVIEW_CRG=0`.
+
+`SKILL.md` is a thin UX layer; the deterministic pipeline lives in Python where it belongs.
 
 ## Quickstart
 
@@ -157,10 +175,20 @@ Reviewer behavior lives in plain-markdown prompts (`skills/review/prompts/*.md`)
   "rejected_count": 3,
   "stats": {
     "model": "…", "duration_s": 41.2, "files_reviewed": 4,
-    "context_truncated": false, "malformed_dropped": 0, "failed_reviewers": []
+    "context_truncated": false, "malformed_dropped": 0, "failed_reviewers": [],
+    "graph": {
+      "files_indexed": 212, "parse_failures": 0, "symbols": 1840,
+      "changed_symbols": 3, "impacted_symbols": 11, "untested_changed": 1,
+      "crg": { "changed_symbols": 2, "files": 1 }
+    }
   }
 }
 ```
+
+`stats.graph` appears when the deterministic first pass ran (the diff touched
+Python files); if the graph fails for any reason the engine falls back to plain
+hunk windows and reviews anyway. `stats.graph.crg` appears only when
+`code-review-graph` also contributed routing for non-Python files.
 
 On an empty diff, it short-circuits to `{"findings": [], "note": "nothing to
 review"}` — no `rejected_count` or `stats` keys. On a fatal error (git failure,
@@ -183,14 +211,15 @@ The Claude Code skill is the first distribution surface, not the architecture. T
 - [x] Design spec ([docs/superpowers/specs](docs/superpowers/specs/2026-08-29-local-review-council-design.md))
 - [x] v0: council + verifier engine, Claude Code skill
 - [x] Claude Code plugin + self-hosted marketplace (`/local-review:review`)
+- [x] v1: deterministic code graph routing — changed symbols, blast radius, risk ranking ([spec](docs/superpowers/specs/2026-08-30-graph-routing-layer-design.md))
 - [ ] Standalone CLI polish (`local-review` entry point)
-- [ ] Static analysis + changed-symbol/test discovery feeding reviewer context
 - [ ] MCP server (one reviewer for Claude Code, Codex, OpenCode, Zed, …)
 - [ ] GitHub Action & pre-commit hook
 - [ ] llama.cpp backend (the engine only speaks OpenAI-compatible HTTP)
 
-## Known limitations (v0)
+## Known limitations
 
+- The built-in symbol graph is Python-only (stdlib `ast`). Other languages get symbol routing only when the optional `code-review-graph` is installed and built, and even then only risk-ranked changed symbols — blast radius stays Python-only. Without it they fall back to hunk-window context. Call/inheritance edges are name-based — ambiguous bare names are deliberately dropped, never guessed, so dynamic dispatch and duplicate names thin the blast radius.
 - Pure renames and git-quoted paths are skipped by the diff parser.
 - The same bug flagged by two categories surfaces as two findings — dedupe is per-category by design.
 - Diff content is not defended against prompt injection; don't point it at untrusted PRs expecting adversarial robustness.
@@ -198,7 +227,7 @@ The Claude Code skill is the first distribution surface, not the architecture. T
 
 ## Contributing
 
-Issues and PRs welcome. The design spec and implementation plan live in [`docs/superpowers/`](docs/superpowers/) — read the spec first; it's the binding authority for how the pipeline behaves. Keep the engine stdlib-only and single-file until a second consumer forces a split.
+Issues and PRs welcome. The design specs and implementation plan live in [`docs/superpowers/`](docs/superpowers/) — read the specs first; they're the binding authority for how the pipeline behaves. Keep the engine stdlib-only: deterministic intelligence in `codegraph.py`, LLM orchestration in `review.py`, and never an LLM call in the first pass.
 
 ## License
 
