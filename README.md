@@ -1,6 +1,6 @@
 <div align="center">
 
-# Local Review Council
+# Local Code Review
 
 **The code review platform that runs entirely on your laptop.**
 
